@@ -92,7 +92,12 @@ sub open
     # Detect REALM
     my $url = $PROTOCOL . $ADDRESS . $cgi;
     my $req = HTTP::Request->new(GET=>$url);
-    my $res = $self->{ua}->request($req);
+
+    ## Stow information on the last request for later reference...
+    $self->{request}->{url} = $url;
+    $self->{request}->{results} = $self->{ua}->request($req);
+
+    my $res = $self->{request}->{results};
 
     if ($res->is_success) {
         $self->{state} = 'open';
@@ -111,7 +116,12 @@ sub open
                     Debug("Changing REALM to '" . $REALM . "'");
                     $self->{ua}->credentials($ADDRESS, $REALM, $USERNAME, $PASSWORD);
                     my $req = HTTP::Request->new(GET=>$url);
-                    $res = $self->{ua}->request($req);
+
+                    ## Stow information on the last request for later reference...
+                    $self->{request}->{url} = $url;
+                    $self->{request}->{results} = $self->{ua}->request($req);
+
+                    $res = $self->{request}->{results};
 
                     if ($res->is_success()) {
                         $self->{state} = 'open';
@@ -167,7 +177,12 @@ sub _sendGetRequest {
 
     my $url = $PROTOCOL . $ADDRESS . $url_path;
     my $req = HTTP::Request->new(GET => $url);
-    my $res = $self->{ua}->request($req);
+
+    ## Stow information on the last request for later reference...
+    $self->{request}->{url} = $url;
+    $self->{request}->{results} = $self->{ua}->request($req);
+
+    my $res = $self->{request}->{results};
 
     if ($res->is_success) {
         return 1;
@@ -210,7 +225,7 @@ sub _sendMomentaryPtzCommand
 
     $self->_sendPtzCommand("start", $command_code, $arg1, $arg2, $arg3);
     my $duration_ns = $duration_ms * 1000;
-    usleep($duration_ns);
+    usleep($duration_ns) if $duration_ns;
     $self->_sendPtzCommand("stop", $command_code, $arg1, $arg2, $arg3);
 }
 
@@ -223,6 +238,59 @@ sub _sendAbsolutePositionCommand
     my $arg4 = shift;
 
     $self->_sendPtzCommand("start", "PositionABS", $arg1, $arg2, $arg3, $arg4);
+}
+
+sub _object2hash
+{
+    my $self = shift;
+    my $object = shift;
+
+    my @elements = split ("\n", $object);
+    my $respObj = {};
+
+    ## NOTE:    Everything passed in to this sub *must* be filtered through a regexp
+    ##          in order to untaint it.
+
+    foreach my $element (@elements) {
+        my $eval_string = '$respObj';
+        my ($keys, $value) = split ("=", $element);
+        my $count = () = $keys =~ /[a-zA-Z\[\]0-9]+\.*/gi;
+        while ($count > 1){
+            $keys =~ s/([a-zA-Z\[\]0-9]+)\.?//i;
+            my $key = $1;
+            $eval_string .= "->{$key}";
+            $count = () = $keys =~ /[a-zA-Z\[\]0-9]+\.*/gi;
+        }
+
+        ## NOTE: We may need to allow for arrays of hashes in
+        ## the object passed in. In that case, we need to duplicate
+        ## the paradigm below in the loop above. -CN
+
+        if ($keys =~ m/([a-zA-Z]+)\[([0-9]+)\]/g){  # This is an array...
+            my $key = $1;
+            my $index = $2;
+            $eval_string .= "->{$key}->\[$index\]";
+        }
+        else {
+            $keys =~ m/([a-zA-Z0-9\.?]+)/g;
+            $eval_string .= "->{$1}";
+        }
+
+        $value =~ m/([a-zA-Z0-9\.]+)/g;
+        $eval_string .= "=\"$1\"";      ##FIXME: We need to cast numerics as such, but this works for now.
+
+        eval "$eval_string";
+
+        if ($@) {
+            Warn("Caught an error attempting to convert an object to a hash: $@");
+            ## FIXME: We need to indicate this to the caller so it can trap the error somehow.
+            return 0;
+        }
+
+    }
+
+    Debug("Done conversion...");
+    return $respObj;
 }
 
 sub moveConLeft
@@ -464,6 +532,17 @@ sub reboot
     $self->_sendGetRequest($cmd);
 }
 
+sub ptzStatus
+{
+    my $self = shift;
+    my $params = shift;
+    Debug( "PTZ Status" );
+    my $cmd = "/cgi-bin/ptz.cgi?action=getStatus&channel=0";
+    $self->_sendGetRequest($cmd) || Fatal("Could not process ptzStatus.");
+    my $object = $self->{request}->{results}->content;
+    my $status = $self->_object2hash($object); ## returns a hashref of converted object
+}
+
 1;
 
 __END__
@@ -519,9 +598,22 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
     This is an private method used to send an absolute position command to the
     camera.
 
+=head 2 _object2hash( $object )
+
+    Where:
+
+        $object = JavaScript object as returned by the camera API
+
+    This is a private method used to convert what is effectively a JavaScript
+    object into a hash for easier processing. The thing passed in is only
+    loosely an object with various elements new-line delimited.
+
+    Since zmcontrol.pl is running -T, everything passed into this method must
+    be untainted via a regexp filter.
+
 =head1 Public Methods
 
-    Methods made available to control.pl via ZoneMinder::Control
+    Methods made available to zmcontrol.pl via ZoneMinder::Control
 
 =head2 Notes:
 
